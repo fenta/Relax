@@ -475,7 +475,7 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 |------|------|--------|------|
 | `--autoscaler-config` | str | None | Autoscaler YAML 配置文件路径。设置后启用自动扩缩容，未设置则禁用。示例：`--autoscaler-config relax/utils/autoscaler/autoscaler.yaml` |
 
-Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-infra/Relax/blob/develop/relax/utils/autoscaler/autoscaler.yaml)。
+Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-infra/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml)。
 
 ### Scale-Out 操作参数
 
@@ -542,6 +542,8 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 | `--slime-router-timeout` | float | None | SlimeRouter HTTP 请求超时时间（秒） |
 | `--slime-router-max-connections` | int | None | SlimeRouter HTTP 客户端最大连接数 |
 | `--slime-router-health-check-failure-threshold` | int | 3 | 连续失败多少次后标记 worker 为不健康 |
+| `--slime-router-sticky` | flag | False | 启用 sticky 粘性会话路由：将路由 key（从 `X-SMG-Routing-Key` 请求头读取）钉定到固定 worker，使同一 key 的后续请求复用该 worker 的 prefix/KV 缓存。已钉定的存活绑定不会因新增 worker 而重分配（仅当其 worker 离开健康集合时才 remap）。需配合 `--use-slime-router` |
+| `--slime-router-sticky-idle-secs` | float | 600.0 | sticky 的 key→worker 绑定空闲（未被路由）超过该秒数后淘汰，避免路由 key 基数无界导致映射表膨胀。需配合 `--slime-router-sticky` |
 
 ---
 

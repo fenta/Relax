@@ -26,7 +26,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.engine.sft.runtime import is_sft_mode
-from relax.utils import telemetry, tracking_utils
+from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory
@@ -703,19 +703,6 @@ def train_one_step(
         forward_only=False,
     )
 
-    valid_step = True
-    # NOTE(jiajia): FP16 precision does not perform NaN validation on loss and gradients, as this validation process would result in duplicate gradient scaling (grad scale).
-    if not getattr(args, "check_for_nan_in_loss_and_grad", True) and not args.fp16:
-        found_inf_flag = optimizer.prepare_grads()
-        if found_inf_flag:
-            valid_step = False
-        else:
-            grad_norm = optimizer.get_grad_norm()
-            if isinstance(grad_norm, torch.Tensor):
-                valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
-            else:
-                valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
-
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step
     if args.ci_test and args.enable_mtp_training:
@@ -723,13 +710,38 @@ def train_one_step(
 
         check_mtp_only_grad(model, step_id, require_non_mtp_zero=not main_loss_has_tokens)
 
-    if valid_step:
-        # Update parameters.
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    # Update parameters. Single optimizer.step() call handles prepare_grads, unscale,
+    # clip, and inner step in one shot — avoids the double prepare_grads/unscale and
+    # double grad_scaler.update that the previous external prepare_grads() flow caused.
+    # In fp16 with dynamic loss scaling, step() returns (False, None, None) on overflow.
+    valid_step = True
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
+    if not getattr(args, "check_for_nan_in_loss_and_grad", True):
+        # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
+        # Detect overflow via the documented (False, None, None) return signature.
+        found_inf_flag = not update_successful and grad_norm is None and num_zeros_in_grad is None
+        if found_inf_flag:
+            valid_step = False
+            current_scale = optimizer.get_loss_scale().item()
+            logger.warning(
+                "Inf found in gradients (step_id=%d, loss_scale=%s), skipping parameter "
+                "update (dynamic loss scaling will reduce scale)",
+                step_id,
+                current_scale,
+            )
+        else:
+            if isinstance(grad_norm, torch.Tensor):
+                valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
+            else:
+                valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
+
+    if valid_step:
         # Update learning rate.
         assert update_successful
         opt_param_scheduler.step(increment=args.global_batch_size)
+    else:
+        grad_norm = float("nan")
 
     # release grad
     for model_chunk in model:
@@ -784,7 +796,8 @@ def train(
         num_microbatches (Sequence[int]): Microbatches per step in the rollout.
     """
     args = get_args()
-    if isinstance(data_iterator[0], DataIterator):
+    is_data_iterator = isinstance(data_iterator[0], DataIterator)
+    if is_data_iterator:
         for iterator in data_iterator:
             iterator.reset()
     else:
@@ -859,16 +872,25 @@ def train(
         pre_hook_enabled = False
 
     num_steps_per_rollout = len(num_microbatches)
+    use_step_iterators = (
+        not is_data_iterator and len(data_iterator) > 1 and isinstance(data_iterator[0], StreamingTQIterator)
+    )
+    if use_step_iterators and len(data_iterator) != num_steps_per_rollout:
+        raise ValueError(
+            f"streaming data_iterator length ({len(data_iterator)}) must match "
+            f"num_steps_per_rollout ({num_steps_per_rollout})"
+        )
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
+        step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
         # Run training step.
         with timer(f"train_micro_batch_{step_id}", keep=False):
             loss_dict, grad_norm = train_one_step(
                 args,
                 rollout_id,
                 step_id,
-                data_iterator,
+                step_data_iterator,
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -1122,13 +1144,10 @@ def initialize_model_and_optimizer(
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
         logger.info("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
 
-    telemetry.mark("setup_begin", role=role)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
-    telemetry.mark("setup_end", role=role)
     model[0].role = role
     reinit_critic_output_layer = _critic_output_layer_needs_reinit(args, model, role)
     clear_memory()
-    telemetry.mark("checkpoint_load_begin", role=role)
     iteration, _ = load_checkpoint(
         model,
         optimizer,
@@ -1136,7 +1155,6 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
-    telemetry.mark("checkpoint_load_end", role=role)
     if reinit_critic_output_layer:
         _reinitialize_critic_output_layer(model)
         if (args.fp16 or args.bf16) and optimizer is not None:
